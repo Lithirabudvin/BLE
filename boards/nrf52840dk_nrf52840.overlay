@@ -1,7 +1,0 @@
-&timer1 {
-    status = "okay";
-};
-
-&adc {
-    status = "disabled";
-};

@@ -8,26 +8,39 @@
  *   -> IMA-ADPCM encoder  (bit-identical to the Dart AdpcmEncoder)
  *   -> BLE GATT NOTIFY    (same service/characteristic UUIDs as the Flutter apps)
  *
- * ── Changes from the original draft ─────────────────────────────────────
+ * ── Fix history ────────────────────────────────────────────────────────
  * 1. nrfx_saadc_simple_mode_set  -> nrfx_saadc_advanced_mode_set
  *    PPI per-sample hardware triggering REQUIRES advanced mode.
- *    Simple mode fires all samples at once on a single trigger; it cannot
- *    accept individual sample tasks from a timer PPI chain.
  *
  * 2. nrfx_saadc_start()  -> nrfx_saadc_mode_trigger()
- *    nrfx_saadc_start() does not exist in nrfx v3 (the API used by NCS v2+).
- *    nrfx_saadc_mode_trigger() arms the driver to accept SAMPLE tasks and
- *    starts DMA into the first pre-queued buffer.
+ *    nrfx_saadc_start() does not exist in this nrfx generation.
  *
- * 3. saadc_handler: buffer re-queue logic corrected for advanced mode.
- *    In advanced mode the driver has ALREADY switched to the second
- *    (pre-queued) buffer by the time EVT_DONE fires for the first one.
- *    The handler must therefore re-queue the buffer that JUST FINISHED
- *    (so it becomes available after the currently-running one completes),
- *    not the one that is already running.
+ * 3. saadc_handler: buffer re-queue corrected for advanced mode — re-queue
+ *    the buffer that JUST finished, not the one currently running.
  *
- * 4. Removed the unused start_advertising() helper (main() calls
- *    bt_le_adv_start() directly, silencing the -Wunused-function warning).
+ * 4. Removed unused start_advertising() helper.
+ *
+ * 5. Manually IRQ_CONNECT the SAADC interrupt before nrfx_saadc_init() —
+ *    we bypass Zephyr's CONFIG_ADC subsystem, so nothing else binds
+ *    SAADC_IRQn into the vector table for us.
+ *
+ * 6. Removed a duplicate nrfx_saadc_init() call.
+ *
+ * 7. The SAADC driver in this nrfx generation returns plain `int`
+ *    (0 = success, negative errno = failure) — NOT the old nrfx_err_t /
+ *    NRFX_SUCCESS (0x0BAD0000) convention. All SAADC calls check
+ *    `!= 0` accordingly. TIMER (below) still uses the classic
+ *    nrfx_err_t / NRFX_SUCCESS convention — the two driver families
+ *    genuinely disagree within the same SDK.
+ *
+ * 8. THE ACTUAL ROOT CAUSE of the timer assert:
+ *    NRFX_TIMER_INSTANCE(reg) casts whatever you pass it directly to
+ *    (NRF_TIMER_Type *) — it expects the peripheral's base-address
+ *    symbol (NRF_TIMER2), NOT a bare instance number.
+ *    NRFX_TIMER_INSTANCE(2) was casting the literal integer 2 to a
+ *    pointer (address 0x00000002), which can never match any real
+ *    TIMER peripheral's base address. This is why the assert failed
+ *    identically regardless of any Kconfig/devicetree changes.
  *
  * ── Packet size ──────────────────────────────────────────────────────────
  * BLOCK_SAMPLES = 800  matches kFramesPerBlock in the Dart apps.
@@ -35,23 +48,22 @@
  * At 8000 Hz that is 10 notifications/second, well within BLE bandwidth.
  * 400 bytes fits in one ATT packet at the MTU=517 the Flutter app negotiates.
  *
- * ── Receiver app compatibility ───────────────────────────────────────────
- * No changes needed in the Flutter receiver.
- * - Same service/characteristic UUIDs.
- * - Same ADPCM encoding (nibble order, step/index tables).
- * - Same 400-byte notification size.
- * - The waveform and level-meter widgets are sample-stream agnostic.
- *   Mono 8 kHz looks correct on the display.
+ * ── PREREQUISITE prj.conf ─────────────────────────────────────────────
+ * CONFIG_NRFX_SAADC=y
+ * CONFIG_NRFX_TIMER=y
+ * (No per-instance NRFX_TIMERn symbol exists in this NCS version —
+ *  the umbrella CONFIG_NRFX_TIMER=y is sufficient for any instance.)
  *
- * ── ADJUST FOR YOUR HARDWARE ─────────────────────────────────────────────
- * PIEZO_AIN_PIN  : AIN pin your piezo signal wire is connected to.
- *                  Default = AIN1 (P0.03). Check your board's pinout.
- * SAMPLE_RATE_HZ : 8000 Hz works for most piezo pickups. Increase for
- *                  higher fidelity (watch BLE throughput).
+ * ── PREREQUISITE boards/adafruit_feather_nrf52840.overlay ────────────
+ * &adc { status = "disabled"; };   // not required (already default-off),
+ *                                  // kept for clarity/documentation.
+ * (No devicetree entry is required for TIMER2 either — the raw nrfx
+ *  driver does not consult devicetree status for instance access.)
  */
 
 #include <zephyr/kernel.h>
 #include <zephyr/device.h>
+#include <zephyr/irq.h>
 #include <zephyr/bluetooth/bluetooth.h>
 #include <zephyr/bluetooth/conn.h>
 #include <zephyr/bluetooth/gatt.h>
@@ -72,6 +84,13 @@ LOG_MODULE_REGISTER(piezo_audio, LOG_LEVEL_INF);
 #define SAMPLE_RATE_HZ    8000
 #define BLOCK_SAMPLES     800   /* must match kFramesPerBlock in Dart */
 #define ADPCM_BLOCK_BYTES (BLOCK_SAMPLES / 2)   /* 400 bytes per notification */
+
+/* Use the highest legal (lowest-priority) IRQ priority for this SoC/
+ * toolchain config rather than a hardcoded number — the SoftDevice
+ * Controller reserves some priority levels for the radio, so the
+ * actual ceiling varies. IRQ_PRIO_LOWEST always resolves correctly.
+ */
+#define SAADC_IRQ_PRIORITY  IRQ_PRIO_LOWEST
 
 /* ── UUIDs ── must match kAudioServiceUuid / kAudioCharUuid in Flutter ──*/
 #define BT_UUID_AUDIO_SERVICE_VAL \
@@ -152,7 +171,10 @@ static int16_t saadc_buf_a[BLOCK_SAMPLES];
 static int16_t saadc_buf_b[BLOCK_SAMPLES];
 static uint8_t adpcm_out[ADPCM_BLOCK_BYTES];
 
-static nrfx_timer_t sample_timer = NRFX_TIMER_INSTANCE(1);
+/* FIX 8: NRFX_TIMER_INSTANCE() needs the peripheral base-address symbol
+ * (NRF_TIMER2), not a bare instance number — see fix history above.
+ */
+static nrfx_timer_t sample_timer = NRFX_TIMER_INSTANCE(NRF_TIMER2);
 
 /* PPI channel 0 — free at boot on a fresh nRF52840. If other peripherals
  * also use PPI, pick a different free channel number.
@@ -179,8 +201,6 @@ static void timer_handler(nrf_timer_event_t event_type, void *ctx)
  * the other buffer (Y, which was pre-queued before mode_trigger() was
  * called). To maintain continuous ping-pong, we must re-queue X (the one
  * that just finished) so it becomes available after Y completes.
- * The original code tried to re-queue Y, which is already running —
- * that produces a NRFX_ERROR_INVALID_STATE error and breaks ping-pong.
  */
 static void saadc_handler(nrfx_saadc_evt_t const *event)
 {
@@ -200,7 +220,12 @@ static void saadc_handler(nrfx_saadc_evt_t const *event)
 
 static void saadc_timer_ppi_init(void)
 {
-    uint32_t err;
+    /* FIX 7: SAADC driver in this nrfx generation returns plain `int`:
+     * 0 = success, negative errno = failure. TIMER below still uses the
+     * classic nrfx_err_t / NRFX_SUCCESS convention.
+     */
+    int saadc_err;
+    nrfx_err_t timer_err;
 
     /* ── SAADC channel ───────────────────────────────────────────────── */
     LOG_INF("Configuring SAADC channel");
@@ -212,81 +237,79 @@ static void saadc_timer_ppi_init(void)
     channel.channel_config.reference = NRF_SAADC_REFERENCE_VDD4;
     channel.channel_config.acq_time  = NRF_SAADC_ACQTIME_10US;
 
-    /* ── SAADC init ──────────────────────────────────────────────────── */
+    /* ── SAADC init ──────────────────────────────────────────────────── *
+     * FIX 5: manually connect the SAADC IRQ before init. We're bypassing
+     * Zephyr's CONFIG_ADC subsystem, so nothing else binds SAADC_IRQn
+     * into the vector table for us.
+     */
     LOG_INF("SAADC init");
-    err = nrfx_saadc_init(NRFX_SAADC_DEFAULT_CONFIG_IRQ_PRIORITY);
-    if (err != NRFX_SUCCESS) {
-        LOG_ERR("SAADC init failed: 0x%08x", err);
+
+    IRQ_CONNECT(SAADC_IRQn, SAADC_IRQ_PRIORITY, nrfx_isr, nrfx_saadc_irq_handler, 0);
+
+    saadc_err = nrfx_saadc_init(SAADC_IRQ_PRIORITY);
+    if (saadc_err != 0) {
+        LOG_ERR("SAADC init failed: %d", saadc_err);
         return;
     }
+    LOG_INF("SAADC init OK");
 
-    err = nrfx_saadc_channels_config(&channel, 1);
-    if (err != NRFX_SUCCESS) {
-        LOG_ERR("SAADC channel config failed: 0x%08x", err);
+    saadc_err = nrfx_saadc_channels_config(&channel, 1);
+    if (saadc_err != 0) {
+        LOG_ERR("SAADC channel config failed: %d", saadc_err);
         return;
     }
 
     /* ── FIX 1: advanced mode instead of simple mode ────────────────────
-     * nrfx_saadc_advanced_mode_set() enables:
-     *   - External per-sample hardware trigger via the SAMPLE task
-     *     (which the PPI wires from the timer).
-     *   - START_ON_END: when one DMA buffer completes, the driver
-     *     automatically starts filling the next pre-queued buffer,
-     *     guaranteeing zero-gap continuous capture.
-     * Simple mode fires all samples at once on a single trigger and does
-     * NOT support per-sample external triggering.
+     * Enables external per-sample hardware trigger via the SAMPLE task
+     * (PPI-wired from the timer) and START_ON_END for zero-gap capture.
      */
     nrfx_saadc_adv_config_t adv_config =
         NRFX_SAADC_DEFAULT_ADV_CONFIG;
 
     adv_config.start_on_end = true;
 
-
-    err = nrfx_saadc_advanced_mode_set(
+    saadc_err = nrfx_saadc_advanced_mode_set(
         BIT(0),
         NRF_SAADC_RESOLUTION_12BIT,
         &adv_config,
         saadc_handler
     );
 
+    LOG_INF("advanced mode ret=%d", saadc_err);
 
-    LOG_INF("advanced mode ret=0x%08x", err);
-
-
-    if (err != NRFX_SUCCESS)
+    if (saadc_err != 0)
     {
-        LOG_ERR("SAADC advanced mode failed");
+        LOG_ERR("SAADC advanced mode failed: %d", saadc_err);
         return;
     }
 
     /* ── Queue both DMA buffers before starting ──────────────────────── */
     LOG_INF("Queuing DMA buffers");
 
-    err = nrfx_saadc_buffer_set(saadc_buf_a, BLOCK_SAMPLES);
-    if (err != NRFX_SUCCESS) {
-        LOG_ERR("Buffer A queue failed: 0x%08x", err);
+    saadc_err = nrfx_saadc_buffer_set(saadc_buf_a, BLOCK_SAMPLES);
+    if (saadc_err != 0) {
+        LOG_ERR("Buffer A queue failed: %d", saadc_err);
         return;
     }
 
     /* Second call queues buf_b as the "next" buffer; the driver will
      * automatically switch to it when buf_a completes (START_ON_END).
      */
-    err = nrfx_saadc_buffer_set(saadc_buf_b, BLOCK_SAMPLES);
-    if (err != NRFX_SUCCESS) {
-        LOG_ERR("Buffer B queue failed: 0x%08x", err);
+    saadc_err = nrfx_saadc_buffer_set(saadc_buf_b, BLOCK_SAMPLES);
+    if (saadc_err != 0) {
+        LOG_ERR("Buffer B queue failed: %d", saadc_err);
         return;
     }
 
     /* ── FIX 2: nrfx_saadc_mode_trigger() instead of nrfx_saadc_start()
-     * nrfx_saadc_start() does not exist in nrfx v3.
-     * nrfx_saadc_mode_trigger() arms the driver to accept SAMPLE tasks
-     * and points the DMA engine at the first pre-queued buffer.
-     * Actual sampling starts when the timer begins firing (below).
+     * Arms the driver to accept SAMPLE tasks and points the DMA engine
+     * at the first pre-queued buffer. Actual sampling starts when the
+     * timer begins firing (below).
      */
     LOG_INF("SAADC mode trigger");
-    err = nrfx_saadc_mode_trigger();
-    if (err != NRFX_SUCCESS) {
-        LOG_ERR("SAADC trigger failed: 0x%08x", err);
+    saadc_err = nrfx_saadc_mode_trigger();
+    if (saadc_err != 0) {
+        LOG_ERR("SAADC trigger failed: %d", saadc_err);
         return;
     }
 
@@ -296,16 +319,18 @@ static void saadc_timer_ppi_init(void)
     nrfx_timer_config_t timer_cfg = {
         .frequency          = NRF_TIMER_FREQ_1MHz,
         .mode               = NRF_TIMER_MODE_TIMER,
-        .bit_width          = NRF_TIMER_BIT_WIDTH_32,
+        .bit_width          = NRF_TIMER_BIT_WIDTH_16,
         .interrupt_priority = NRFX_TIMER_DEFAULT_CONFIG_IRQ_PRIORITY,
         .p_context          = NULL,
     };
 
-    err = nrfx_timer_init(&sample_timer, &timer_cfg, timer_handler);
-    if (err != NRFX_SUCCESS) {
-        LOG_ERR("Timer init failed: 0x%08x", err);
+    /* TIMER driver: still the classic nrfx_err_t / NRFX_SUCCESS API. */
+    timer_err = nrfx_timer_init(&sample_timer, &timer_cfg, timer_handler);
+    if (timer_err != NRFX_SUCCESS) {
+        LOG_ERR("Timer init failed: 0x%08x", timer_err);
         return;
     }
+    LOG_INF("Timer init OK");
 
     /* Compare value = 1 MHz / 8000 Hz = 125 ticks between samples. */
     uint32_t ticks = 1000000UL / SAMPLE_RATE_HZ;
@@ -425,10 +450,6 @@ int main(void)
     }
     LOG_INF("Bluetooth ready");
 
-    /* FIX 4: start_advertising() helper removed — call bt_le_adv_start
-     * directly here as was already done in main(), silencing the
-     * -Wunused-function warning from the original draft.
-     */
     err = bt_le_adv_start(BT_LE_ADV_CONN_FAST_1, ad, ARRAY_SIZE(ad), NULL, 0);
     if (err) {
         LOG_ERR("Advertising failed: %d", err);
