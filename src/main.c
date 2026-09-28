@@ -42,6 +42,8 @@ LOG_MODULE_REGISTER(piezo_audio, LOG_LEVEL_INF);
 #define ADPCM_BLOCK_BYTES (BLOCK_SAMPLES / 2)
 
 #define SAADC_IRQ_PRIORITY  IRQ_PRIO_LOWEST
+#define GAIN_FACTOR 200
+
 
 #define BT_UUID_AUDIO_SERVICE_VAL \
     BT_UUID_128_ENCODE(0x12345678, 0x1234, 0x1234, 0x1234, 0x123456789abc)
@@ -129,12 +131,56 @@ static void timer_handler(nrf_timer_event_t event_type, void *ctx)
     ARG_UNUSED(ctx);
 }
 
+
+static void center_and_gain(int16_t *buf, size_t count)
+{
+    /* 1. Compute this block's average (its DC bias point). */
+    int32_t sum = 0;
+    for (int i = 0; i < count; i++) {
+        sum += buf[i];
+    }
+    int32_t avg = sum / count;
+ 
+    /* 2. Subtract the average, then apply gain, with clamping. */
+    for (int i = 0; i < count; i++) {
+        int32_t centered = (int32_t)buf[i] - avg;
+        int32_t amplified = centered * GAIN_FACTOR;
+ 
+        if (amplified > 32767)  amplified = 32767;
+        if (amplified < -32768) amplified = -32768;
+ 
+        buf[i] = (int16_t)amplified;
+    }
+}
+
+
+
 static void saadc_handler(nrfx_saadc_evt_t const *event)
 {
-    if (event->type == NRFX_SAADC_EVT_DONE) {
+    switch (event->type) {
+    case NRFX_SAADC_EVT_DONE:
+        /* A block finished capturing — hand it off to the main loop. */
         ready_buf = (int16_t *)event->data.done.p_buffer;
-        nrfx_saadc_buffer_set(ready_buf, BLOCK_SAMPLES);
         block_ready = true;
+        break;
+
+    case NRFX_SAADC_EVT_BUF_REQ:
+        /* Driver is proactively asking for the next buffer to use.
+         * Ping-pong between the two static buffers.
+         */
+        {
+            static bool use_a = true;
+            int16_t *next = use_a ? saadc_buf_a : saadc_buf_b;
+            use_a = !use_a;
+            int req_err = nrfx_saadc_buffer_set(next, BLOCK_SAMPLES);
+            if (req_err != 0) {
+                printk("BUF_REQ re-supply failed: %d\n", req_err);
+            }
+        }
+        break;
+
+    default:
+        break;
     }
 }
 
@@ -247,6 +293,28 @@ static void saadc_timer_ppi_init(void)
 
     LOG_INF("SAADC running: %d Hz, block %d samples -> %d ADPCM bytes",
             SAMPLE_RATE_HZ, BLOCK_SAMPLES, ADPCM_BLOCK_BYTES);
+
+    /* ── DIAGNOSTIC: manual software-triggered self-test ─────────────────
+     * Bypasses PPI/timer entirely by firing the SAMPLE task directly from
+     * software a few times. If "*** SAADC DONE fired ***" prints after
+     * THIS but the PPI-driven path still never fires afterward, that
+     * proves SAADC/DMA itself works fine and the bug is specifically in
+     * the TIMER->PPI->SAMPLE wiring. If DONE never fires even here, the
+     * problem is in SAADC/DMA setup itself, not PPI.
+     * Safe to delete once the real cause is found.
+     */
+    printk("--- Starting manual SAMPLE self-test (3 triggers, 200ms apart) ---\n");
+    for (int i = 0; i < 3; i++) {
+        k_sleep(K_MSEC(200));
+        printk("Manual trigger #%d\n", i + 1);
+        nrf_saadc_task_trigger(NRF_SAADC, NRF_SAADC_TASK_SAMPLE);
+    }
+    printk("--- Self-test triggers sent, watch for DONE prints above ---\n");
+
+    /* DIAGNOSTIC: confirm TIMER2 is actually counting at all. */
+    k_sleep(K_MSEC(50));
+    uint32_t counter = nrfx_timer_capture(&sample_timer, NRF_TIMER_CC_CHANNEL1);
+    printk("TIMER2 counter after 50ms = %u (expect large nonzero, ticks at 1MHz)\n", counter);
 }
 
 static bool           notify_enabled = false;
@@ -349,6 +417,7 @@ int main(void)
                 LOG_INF("ADC raw  min=%d  max=%d", min_v, max_v);
             }
 
+            center_and_gain(ready_buf, BLOCK_SAMPLES);
             adpcm_encode_block(ready_buf, adpcm_out);
             send_adpcm_block(adpcm_out, ADPCM_BLOCK_BYTES);
         }
