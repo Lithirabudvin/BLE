@@ -19,7 +19,13 @@
 
 LOG_MODULE_REGISTER(ble_audio, LOG_LEVEL_INF);
 
-#define QUEUE_DEPTH  8
+/* ~1 s of buffering at one 960-sample (60 ms) block per slot. Gives the
+ * MTU/data-length/PHY/conn-param negotiation in ble_app.c (now started
+ * immediately on connect, taking roughly 300-1500 ms) enough headroom to
+ * finish without dropping blocks, without holding excess audio latency
+ * once the link is tuned and draining at full speed. 16 blocks * 1920
+ * bytes = ~30 KB, fine on the nRF52840's 256 KB RAM. */
+#define QUEUE_DEPTH  16
 #define MAX_PAYLOAD  240      /* max sample bytes per notification */
 
 static struct bt_uuid_128 audio_service_uuid =

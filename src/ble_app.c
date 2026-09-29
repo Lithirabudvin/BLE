@@ -53,6 +53,51 @@ static struct bt_gatt_cb gatt_callbacks = {
     .att_mtu_updated = mtu_updated,
 };
 
+/*
+ * ATT MTU exchange. The MTU can only be negotiated ONCE per connection,
+ * and it stays at the 23-byte default forever if neither side asks for
+ * more. Many BLE centrals (test tools, nRF Connect for Desktop, some
+ * generic scanners) never request a bigger MTU on their own -- so the
+ * peripheral has to ask. Requesting it here, immediately on connect,
+ * also wins the race against a central that only exchanges MTU later
+ * (e.g. only when you click a button in a desktop tool), since a second
+ * exchange attempt after one has already completed is simply rejected.
+ *
+ * At MTU=23 a notification can carry only 18 payload bytes, so a 1920
+ * byte audio block needs ~107 notifications -- far more than fit in the
+ * time budget, which is what caused the "PCM queue full" drops. Once
+ * this succeeds the sender in ble_audio.c automatically starts using
+ * the bigger payload (it reads bt_gatt_get_mtu() per packet already).
+ */
+static struct bt_gatt_exchange_params mtu_exchange_params;
+
+static void mtu_exchange_cb(struct bt_conn *conn, uint8_t err,
+                            struct bt_gatt_exchange_params *params)
+{
+    ARG_UNUSED(params);
+
+    if (err) {
+        LOG_WRN("MTU exchange failed (err %u), staying at %u bytes",
+                err, bt_gatt_get_mtu(conn));
+    } else {
+        LOG_INF("MTU exchange accepted, now %u bytes", bt_gatt_get_mtu(conn));
+    }
+}
+
+static void request_mtu_exchange(struct bt_conn *conn)
+{
+    mtu_exchange_params.func = mtu_exchange_cb;
+
+    int err = bt_gatt_exchange_mtu(conn, &mtu_exchange_params);
+
+    if (err) {
+        /* -EALREADY here just means the central already exchanged MTU
+         * before we asked (e.g. during service discovery) -- harmless,
+         * whatever value resulted is what we're stuck with. */
+        LOG_WRN("MTU exchange request failed: %d", err);
+    }
+}
+
 static void connected(struct bt_conn *conn, uint8_t err)
 {
     if (err) {
@@ -62,10 +107,17 @@ static void connected(struct bt_conn *conn, uint8_t err)
     LOG_INF("Connected");
     current_conn = bt_conn_ref(conn);
 
-    /* Ask for the fastest link settings; the central may still refuse.
-     * Faster links help both audio streaming and OTA transfer speed. */
+    /* Ask for a bigger MTU right away -- see request_mtu_exchange(). */
+    request_mtu_exchange(conn);
+
+    /* Data length / PHY / connection interval tuning, run as a short
+     * sequence with a small gap between steps rather than all at once,
+     * since a BLE controller can only have one such procedure active
+     * per connection at a time. Starts almost immediately now (used to
+     * wait a full 2 s first) so audio has less time to overrun the
+     * queue before the link is tuned. */
     tune_step = 0;
-    k_work_reschedule(&tune_work, K_SECONDS(2));
+    k_work_reschedule(&tune_work, K_MSEC(300));
 }
 
 static void disconnected(struct bt_conn *conn, uint8_t reason)
@@ -78,9 +130,6 @@ static void disconnected(struct bt_conn *conn, uint8_t reason)
         current_conn = NULL;
     }
 }
-
-
-
 
 static void tune_fn(struct k_work *w)
 {
@@ -100,7 +149,7 @@ static void tune_fn(struct k_work *w)
     if (e) {
         LOG_WRN("Link tuning step %d failed: %d", tune_step - 1, e);
     }
-    k_work_reschedule(&tune_work, K_MSEC(700));
+    k_work_reschedule(&tune_work, K_MSEC(500));
 }
 
 static void recycled(void)
