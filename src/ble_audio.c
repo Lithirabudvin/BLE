@@ -38,6 +38,13 @@ K_MSGQ_DEFINE(pcm_q, sizeof(struct pcm_block), QUEUE_DEPTH, 4);
 static volatile bool notify_enabled;
 static uint16_t seq;
 
+/* Ground-truth throughput measurement: logs the achieved notification
+ * rate once a second, independent of any Kconfig/interval theory.
+ * Compare this directly against the 133.3/sec (8 notifications *
+ * 16.67 blocks/sec) the audio actually needs. */
+static uint32_t notify_count;
+static int64_t rate_window_start;
+
 static void audio_ccc_cfg_changed(const struct bt_gatt_attr *attr,
                                   uint16_t value)
 {
@@ -99,6 +106,8 @@ static void sender_thread(void *a, void *b, void *c)
     static struct pcm_block blk;
     uint8_t pkt[2 + MAX_PAYLOAD];
 
+    rate_window_start = k_uptime_get();
+
     while (1) {
         k_msgq_get(&pcm_q, &blk, K_FOREVER);
 
@@ -142,6 +151,16 @@ static void sender_thread(void *a, void *b, void *c)
             seq++;
             p += n;
             left -= n;
+
+            notify_count++;
+            int64_t now = k_uptime_get();
+
+            if ((now - rate_window_start) >= 1000) {
+                LOG_INF("Notification rate: %u/sec (need ~133/sec for real-time)",
+                        notify_count);
+                notify_count = 0;
+                rate_window_start = now;
+            }
         }
     }
 }

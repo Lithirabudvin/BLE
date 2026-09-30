@@ -22,6 +22,23 @@
 static struct k_work_delayable tune_work;
 static int tune_step;
 
+/*
+ * The tune sequence above runs ONCE per connection and then stops. That's
+ * fine for MTU/DLE/PHY, which only need to be set once -- but the central
+ * (Android in particular) can re-open connection-parameter negotiation on
+ * its OWN schedule at any later point in the connection, independent of
+ * anything we request. Each log has shown the interval drifting back up
+ * minutes after our one-shot request already succeeded -- that's the
+ * central doing this, not our firmware failing to ask.
+ *
+ * This watchdog re-asks for the fast interval every time le_param_updated()
+ * reports something slower than we want, for as long as the connection
+ * lasts, instead of giving up after the first attempt.
+ */
+#define DESIRED_INTERVAL_MAX_UNITS  6   /* 6 * 1.25ms = 7.5 ms */
+
+static struct k_work_delayable retune_work;
+
 LOG_MODULE_REGISTER(ble_app, LOG_LEVEL_INF);
 
 static struct bt_conn *current_conn;
@@ -125,6 +142,9 @@ static void disconnected(struct bt_conn *conn, uint8_t reason)
     ARG_UNUSED(conn);
     LOG_INF("Disconnected (reason %u)", reason);
 
+    k_work_cancel_delayable(&tune_work);
+    k_work_cancel_delayable(&retune_work);
+
     if (current_conn) {
         bt_conn_unref(current_conn);
         current_conn = NULL;
@@ -152,6 +172,25 @@ static void tune_fn(struct k_work *w)
     k_work_reschedule(&tune_work, K_MSEC(500));
 }
 
+static void retune_fn(struct k_work *w)
+{
+    ARG_UNUSED(w);
+
+    if (!current_conn) {
+        return;
+    }
+
+    /* Same pinned request tune_fn's step 2 used -- ask again, since the
+     * central has drifted away from it on its own. */
+    int e = bt_conn_le_param_update(current_conn, BT_LE_CONN_PARAM(6, 6, 0, 400));
+
+    if (e) {
+        LOG_WRN("Re-tune param update failed: %d", e);
+    } else {
+        LOG_INF("Central drifted off the fast interval -- re-requested it");
+    }
+}
+
 static void recycled(void)
 {
     int err = start_advertising();
@@ -177,14 +216,32 @@ static void le_param_updated(struct bt_conn *conn, uint16_t interval,
     LOG_INF("Conn params: interval %u.%02u ms, latency %u, timeout %u ms",
             (interval * 5U) / 4U, ((interval * 5U) % 4U) * 25U,
             latency, timeout * 10U);
+
+    if (interval > DESIRED_INTERVAL_MAX_UNITS) {
+        /* Give the central a few seconds in case this is part of its own
+         * settling process, then ask again. Runs for as long as the
+         * connection lasts -- unlike the one-shot tune sequence, this
+         * keeps correcting drift for the whole session. */
+        k_work_reschedule(&retune_work, K_SECONDS(3));
+    }
+}
+
+static void le_data_len_updated(struct bt_conn *conn,
+                                struct bt_conn_le_data_len_info *info)
+{
+    ARG_UNUSED(conn);
+    LOG_INF("DLE: TX %u B/%u us, RX %u B/%u us",
+            info->tx_max_len, info->tx_max_time,
+            info->rx_max_len, info->rx_max_time);
 }
 
 BT_CONN_CB_DEFINE(conn_callbacks) = {
-    .connected        = connected,
-    .disconnected     = disconnected,
-    .recycled         = recycled,
-    .le_phy_updated   = le_phy_updated,
-    .le_param_updated = le_param_updated,
+    .connected           = connected,
+    .disconnected        = disconnected,
+    .recycled            = recycled,
+    .le_phy_updated      = le_phy_updated,
+    .le_param_updated    = le_param_updated,
+    .le_data_len_updated = le_data_len_updated,
 };
 
 struct bt_conn *ble_app_get_conn(void)
@@ -195,6 +252,7 @@ struct bt_conn *ble_app_get_conn(void)
 int ble_app_init(void)
 {
     k_work_init_delayable(&tune_work, tune_fn);
+    k_work_init_delayable(&retune_work, retune_fn);
 
     int err = bt_enable(NULL);
     LOG_INF("bt_enable: %d", err);
